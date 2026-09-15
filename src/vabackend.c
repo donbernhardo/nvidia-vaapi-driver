@@ -1707,11 +1707,12 @@ static VAStatus nvDestroySurfaces(
 
         LOG_DEBUG("Destroying surface %d (%p)", surface->pictureIdx, surface);
 
+        NVContext *surfaceContext = (NVContext*) surface->context;
         // Only wait if the surface's context still has a running resolve thread.
         // If the context was already destroyed, the resolve thread has exited and
         // will never signal the condition variable, so waiting would hang forever.
         // In that case, just clear the resolving flag and proceed.
-        if (surface->context != NULL && surface->context->resolveThreadStarted && !surface->context->exiting) {
+        if (surfaceContext != NULL && surfaceContext->resolveThreadStarted && !surfaceContext->exiting) {
             waitSurfaceResolved(surface);
         } else {
             // Context destroyed or thread not running - manually clear resolving flag
@@ -1725,6 +1726,13 @@ static VAStatus nvDestroySurfaces(
                 img->resolving = 0;
                 pthread_mutex_unlock(&img->mutex);
             }
+        }
+
+        //nvEndPicture may wait on the context's most recently queued surface
+        //before resizing the decoder's display area; don't leave it pointing
+        //at a surface that no longer exists.
+        if (surfaceContext != NULL && surfaceContext->lastQueuedSurface == surface) {
+            surfaceContext->lastQueuedSurface = NULL;
         }
 
         drv->backend->detachBackingImageFromSurface(drv, surface);
@@ -1993,6 +2001,10 @@ static VAStatus recreateDecoderForSurface(NVContext *nvCtx, NVSurface *surface) 
     nvCtx->decoderSurfaceFormat = surface->format;
     nvCtx->decoderChromaFormat = surface->chromaFormat;
     nvCtx->decoderBitDepth = surface->bitDepth;
+    //a new decoder starts out with the context-sized display area
+    nvCtx->appliedDisplayWidth = 0;
+    nvCtx->appliedDisplayHeight = 0;
+    nvCtx->decoderHasDecoded = false;
     nvStatsIncrement(drv, NV_STAT_DECODER_CREATES);
     return VA_STATUS_SUCCESS;
 }
@@ -3029,6 +3041,62 @@ static VAStatus nvRenderPicture(
     return VA_STATUS_SUCCESS;
 }
 
+/* Whether the decoder's display area differs from the size of the frame that
+ * is about to be decoded. Only AV1 requests a size; other codecs leave it 0. */
+static bool nvDisplayAreaNeedsUpdate(const NVContext *nvCtx) {
+    if (nvCtx->requestedDisplayWidth == 0 || nvCtx->requestedDisplayHeight == 0) {
+        return false;
+    }
+    const uint32_t appliedWidth = nvCtx->appliedDisplayWidth != 0 ? nvCtx->appliedDisplayWidth : nvCtx->width;
+    const uint32_t appliedHeight = nvCtx->appliedDisplayHeight != 0 ? nvCtx->appliedDisplayHeight : nvCtx->height;
+    return nvCtx->requestedDisplayWidth != appliedWidth || nvCtx->requestedDisplayHeight != appliedHeight;
+}
+
+/* Point the decoder's display area at the size of the frame being decoded.
+ *
+ * An AV1 frame can be coded smaller than the sequence maximum that the context
+ * and its surfaces were created with (frame_size_override_flag). NVDEC does not
+ * crop such a frame, it stretches it to fill the display area. So crop the
+ * display area to the real frame size and place it unscaled in the top-left
+ * corner of the unchanged, surface-sized target; the backend copy then keeps
+ * working with the layout it already expects.
+ *
+ * Must be called with the CUDA context pushed. NVDEC refuses this before the
+ * decoder has decoded a picture, which is why nvEndPicture applies the first
+ * change right after the first decode. The applied size is only recorded on
+ * success, so a refused change is simply tried again on the next picture. */
+static void nvApplyRequestedDisplayArea(NVContext *nvCtx) {
+    uint32_t width = nvCtx->requestedDisplayWidth;
+    uint32_t height = nvCtx->requestedDisplayHeight;
+
+    //match the chroma alignment nvCreateContext applies to the display area
+    if (nvCtx->decoderChromaFormat == cudaVideoChromaFormat_420 ||
+        nvCtx->decoderChromaFormat == cudaVideoChromaFormat_422) {
+        width = (width + 1) & ~1u;
+    }
+    if (nvCtx->decoderChromaFormat == cudaVideoChromaFormat_420) {
+        height = (height + 1) & ~1u;
+    }
+
+    CUVIDRECONFIGUREDECODERINFO info = {
+        .ulWidth = nvCtx->width,
+        .ulHeight = nvCtx->height,
+        .ulTargetWidth = nvCtx->width,
+        .ulTargetHeight = nvCtx->height,
+        .ulNumDecodeSurfaces = nvCtx->surfaceCount,
+        .display_area = { .left = 0, .top = 0, .right = (short) width, .bottom = (short) height },
+        .target_rect = { .left = 0, .top = 0, .right = (short) width, .bottom = (short) height },
+    };
+    if (CHECK_CUDA_RESULT(cv->cuvidReconfigureDecoder(nvCtx->decoder, &info))) {
+        LOG("Unable to set decoder display area to %ux%u", width, height);
+        return;
+    }
+
+    LOG_DEBUG("Decoder display area set to %ux%u (surfaces %ux%u)", width, height, nvCtx->width, nvCtx->height);
+    nvCtx->appliedDisplayWidth = nvCtx->requestedDisplayWidth;
+    nvCtx->appliedDisplayHeight = nvCtx->requestedDisplayHeight;
+}
+
 static VAStatus nvEndPicture(
         VADriverContextP ctx,
         VAContextID context
@@ -3053,7 +3121,21 @@ static VAStatus nvEndPicture(
     nvCtx->sliceOffsets.size = 0;
 
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPushCurrent(drv->cudaContext), VA_STATUS_ERROR_OPERATION_FAILED);
+    if (nvCtx->decoderHasDecoded && nvDisplayAreaNeedsUpdate(nvCtx)) {
+        //frames already queued were decoded for the old size and are cropped
+        //when they are mapped, so let them finish before changing the display area
+        waitSurfaceResolved(nvCtx->lastQueuedSurface);
+        nvApplyRequestedDisplayArea(nvCtx);
+    }
     CUresult result = cv->cuvidDecodePicture(nvCtx->decoder, picParams);
+    if (result == CUDA_SUCCESS) {
+        if (!nvCtx->decoderHasDecoded && nvDisplayAreaNeedsUpdate(nvCtx)) {
+            //the first reconfigure is only accepted once something has been decoded,
+            //and has to land before this picture reaches the resolve thread
+            nvApplyRequestedDisplayArea(nvCtx);
+        }
+        nvCtx->decoderHasDecoded = true;
+    }
     CHECK_CUDA_RESULT_RETURN(cu->cuCtxPopCurrent(NULL), VA_STATUS_ERROR_OPERATION_FAILED);
     nvStatsIncrement(drv, NV_STAT_DECODE_PICTURES);
 
@@ -3079,6 +3161,7 @@ static VAStatus nvEndPicture(
     //TODO check we're not overflowing the queue
     pthread_mutex_lock(&nvCtx->resolveMutex);
     nvCtx->surfaceQueue[nvCtx->surfaceQueueWriteIdx++] = surface;
+    nvCtx->lastQueuedSurface = surface;
     if (nvCtx->surfaceQueueWriteIdx >= SURFACE_QUEUE_SIZE) {
         nvCtx->surfaceQueueWriteIdx = 0;
     }
