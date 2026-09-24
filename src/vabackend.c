@@ -1697,7 +1697,10 @@ static VAStatus nvDestroySurfaces(
         //before resizing the decoder's display area; don't leave it pointing
         //at a surface that no longer exists
         NVContext *surfaceContext = (NVContext*) surface->context;
-        if (surfaceContext != NULL && surfaceContext->lastQueuedSurface == surface) {
+        //vaDestroyContext can run before vaDestroySurfaces, leaving this pointer
+        //stale. Check the object table before reading anything from the context.
+        if (getObjectByPtr(drv, OBJECT_TYPE_CONTEXT, surfaceContext) != NULL &&
+            surfaceContext->lastQueuedSurface == surface) {
             waitSurfaceResolved(surface);
             surfaceContext->lastQueuedSurface = NULL;
         }
