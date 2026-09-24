@@ -1708,11 +1708,14 @@ static VAStatus nvDestroySurfaces(
         LOG_DEBUG("Destroying surface %d (%p)", surface->pictureIdx, surface);
 
         NVContext *surfaceContext = (NVContext*) surface->context;
+        //vaDestroyContext can leave this pointer stale. Validate it before
+        //reading either the resolve-thread state or lastQueuedSurface.
+        bool contextAlive = getObjectByPtr(drv, OBJECT_TYPE_CONTEXT, surfaceContext) != NULL;
         // Only wait if the surface's context still has a running resolve thread.
         // If the context was already destroyed, the resolve thread has exited and
         // will never signal the condition variable, so waiting would hang forever.
         // In that case, just clear the resolving flag and proceed.
-        if (surfaceContext != NULL && surfaceContext->resolveThreadStarted && !surfaceContext->exiting) {
+        if (contextAlive && surfaceContext->resolveThreadStarted && !surfaceContext->exiting) {
             waitSurfaceResolved(surface);
         } else {
             // Context destroyed or thread not running - manually clear resolving flag
@@ -1731,7 +1734,7 @@ static VAStatus nvDestroySurfaces(
         //nvEndPicture may wait on the context's most recently queued surface
         //before resizing the decoder's display area; don't leave it pointing
         //at a surface that no longer exists.
-        if (surfaceContext != NULL && surfaceContext->lastQueuedSurface == surface) {
+        if (contextAlive && surfaceContext->lastQueuedSurface == surface) {
             surfaceContext->lastQueuedSurface = NULL;
         }
 
